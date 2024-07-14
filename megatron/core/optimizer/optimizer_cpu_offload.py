@@ -1,4 +1,16 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024 Alibaba PAI and Nvidia Megatron-LM Team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Megatron optimizer."""
 
@@ -6,31 +18,15 @@ import math
 from abc import ABC, abstractmethod
 from itertools import chain
 from logging import getLogger
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
 
-HAVE_APEX_OR_TE = True
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
 except ImportError:
-    try:
-        from apex.multi_tensor_apply import multi_tensor_applier
-    except ImportError:
-        from megatron.core.utils import local_multi_tensor_applier
-
-        multi_tensor_applier = local_multi_tensor_applier
-    try:
-        import amp_C
-
-        l2_norm_impl = amp_C.multi_tensor_l2norm
-        multi_tensor_scale_impl = amp_C.multi_tensor_scale
-    except ImportError:
-        HAVE_APEX_OR_TE = False
-        from megatron.core.utils import local_multi_tensor_l2_norm, local_multi_tensor_scale
-
-        l2_norm_impl = local_multi_tensor_l2_norm
-        multi_tensor_scale_impl = local_multi_tensor_scale
+    from apex.multi_tensor_apply import multi_tensor_applier
+    from amp_C import multi_tensor_scale
 
 from .. import parallel_state, tensor_parallel
 from ..dist_checkpointing.mapping import ShardedStateDict
@@ -77,7 +73,7 @@ def _multi_tensor_copy_this_to_that(
     if overflow_buf:
         overflow_buf.fill_(0)
         # Scaling with factor `1.0` is equivalent to copy.
-        multi_tensor_applier(multi_tensor_scale_impl, overflow_buf, [this, that], 1.0)
+        multi_tensor_applier(multi_tensor_scale, overflow_buf, [this, that], 1.0)
     else:
         for this_, that_ in zip(this, that):
             that_.copy_(this_)
@@ -166,7 +162,7 @@ class MegatronOptimizer(ABC):
         params = self.get_parameters()
         grads_for_norm = self.get_main_grads_for_grad_norm()
         grad_norm = get_grad_norm_fp32(
-            grads_for_norm, model_parallel_group=self.get_model_parallel_group()
+            grads_for_norm, model_parallel_group=self.get_model_parallel_group(), norm_type=1.0
         )
         clip_grad_by_total_norm_fp32(params, clip_grad, grad_norm)
         return grad_norm
@@ -375,6 +371,102 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         return False
 
+    def preprocess_grads(self) -> bool:
+        """
+            this function temperorarily generates a fp32 grad on cuda
+            and use grad_norm_clip then copy them to cpu
+        """
+        timers = self.config.timers
+        # 1. collect fp32 grads from fp16 model
+        params = None
+        main_grads, main_param_id_to_main_grad_mapping = self._collect_grads()
+
+        # 2. unscale / check inf
+        # Reset found inf.
+        if self.grad_scaler:
+            if timers is not None:
+                timers('optimizer-unscale-and-check-inf', log_level=1).start(
+                    barrier=self.config.barrier_with_L1_time
+                )
+
+            self.found_inf.fill_(0.0)
+
+            # Unscale and set found inf/nan
+            torch._amp_foreach_non_finite_check_and_unscale_(
+                main_grads, self.found_inf, self.grad_scaler.inv_scale
+            )
+
+            # Update across all model parallel instances.
+            torch.distributed.all_reduce(
+                self.found_inf, op=torch.distributed.ReduceOp.MAX, group=self.get_model_parallel_group()
+            )
+
+            # Check for nan.
+            found_inf_flag = self.found_inf.item() > 0
+            if timers is not None:
+                timers('optimizer-unscale-and-check-inf').stop()
+
+            if found_inf_flag:
+                return False, None, None
+
+        # 3. compute grad norm and clip
+        if timers is not None:
+            timers('optimizer-clip-main-grad', log_level=1).start(
+                barrier=self.config.barrier_with_L1_time
+            )
+        grad_norm = None
+        def _internal_get_main_grads_for_grad_norm(params):
+            grads_for_norm = []
+            for param in params:
+                # O(n) to O(n^2)
+                if id(param) not in main_param_id_to_main_grad_mapping:
+                    continue
+                grad = main_param_id_to_main_grad_mapping[id(param)]
+                is_not_shared = param_is_not_shared(param)
+                is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(param)
+                if is_not_shared and is_not_tp_duplicate:
+                    grads_for_norm.append(grad)
+            return grads_for_norm
+        
+        def _internal_clip_grad_by_total_norm_fp32(
+            main_grads: Union[List[torch.Tensor], torch.Tensor],
+            max_norm: Union[int, float],
+            total_norm: float,
+        ):
+            # Grads.
+            grads = []
+            for g in main_grads:
+                assert g.type() == 'torch.cuda.FloatTensor'
+                grads.append(g.detach())
+
+            # Scale.
+            clip_coeff = max_norm / (total_norm + 1.0e-6)
+            if clip_coeff < 1.0:
+                dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+                multi_tensor_applier(multi_tensor_scale, dummy_overflow_buf, [grads, grads], clip_coeff)
+
+        if self.config.clip_grad > 0.0:
+            params = self.get_parameters()
+            grads_for_norm = _internal_get_main_grads_for_grad_norm(params)
+            grad_norm = get_grad_norm_fp32(
+                grads_for_norm, model_parallel_group=self.get_model_parallel_group()
+            )
+            _internal_clip_grad_by_total_norm_fp32(main_grads, self.config.clip_grad, grad_norm)
+        if timers is not None:
+            timers('optimizer-clip-main-grad').stop()
+
+        if timers is not None:
+            timers('optimizer-copy-grad-to-cpu', log_level=1).start(
+                barrier=self.config.barrier_with_L1_time
+            )
+        # 4. move these grads to CPU
+        self._dispatch_grads(params, main_param_id_to_main_grad_mapping)
+
+        if timers is not None:
+            timers('optimizer-copy-grad-to-cpu').stop()
+
+        return True, grad_norm, None
+
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer with ready gradients, return successful."""
@@ -402,37 +494,42 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def step(self):
         timers = self.config.timers
+        if getattr(self, 'cpu_offload', False):
+            success, grad_norm, num_zeros_in_grad = self.preprocess_grads()
+            if success:
+                success = self.step_with_ready_grads()
+            # Successful update.
+            return success, grad_norm, num_zeros_in_grad
+        else:
+            found_inf_flag = self.prepare_grads()
+            if found_inf_flag:
+                return False, None, None
 
-        found_inf_flag = self.prepare_grads()
-        if found_inf_flag:
-            return False, None, None
+            # Clip the main gradients.
+            if timers is not None:
+                timers('optimizer-clip-main-grad', log_level=1).start(
+                    barrier=self.config.barrier_with_L1_time
+                )
+            grad_norm = None
+            if self.config.clip_grad > 0.0:
+                grad_norm = self.clip_grad_norm(self.config.clip_grad)
+            if timers is not None:
+                timers('optimizer-clip-main-grad').stop()
 
-        # Clip the main gradients.
-        if timers is not None:
-            timers('optimizer-clip-main-grad', log_level=1).start(
-                barrier=self.config.barrier_with_L1_time
-            )
-        grad_norm = None
-        if self.config.clip_grad > 0.0:
-            grad_norm = self.clip_grad_norm(self.config.clip_grad)
-        if timers is not None:
-            timers('optimizer-clip-main-grad').stop()
+            # Count the zeros in the grads.
+            if timers is not None:
+                timers('optimizer-count-zeros', log_level=1).start(
+                    barrier=self.config.barrier_with_L1_time
+                )
+            num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
+            if timers is not None:
+                timers('optimizer-count-zeros').stop()
 
-        # Count the zeros in the grads.
-        if timers is not None:
-            timers('optimizer-count-zeros', log_level=1).start(
-                barrier=self.config.barrier_with_L1_time
-            )
-        num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
-        if timers is not None:
-            timers('optimizer-count-zeros').stop()
+            success = self.step_with_ready_grads()
 
-        success = self.step_with_ready_grads()
-
-        # Successful update.
-        return success, grad_norm, num_zeros_in_grad
-
-
+            # Successful update.
+            return success, grad_norm, num_zeros_in_grad
+        
 class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
     """Float16 optimizer for fp16 and bf16 data types.
 
@@ -453,6 +550,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         config: OptimizerConfig,
         grad_scaler: MegatronGradScaler,
         init_state_fn: Callable,
+        cpu_offload: bool = False,
     ):
 
         super().__init__(
@@ -463,29 +561,40 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         )
 
         # Handle main parameters.
-
+        self.cpu_offload = cpu_offload
         # Three groups of parameters:
         #   float16_groups: original float16 parameters
         #   fp32_from_float16_groups: fp32 copy of float16 parameters
         #   fp32_from_fp32_groups: original fp32 parameters
-        self.float16_groups = []
+
+        # NOTE: 2024.7.9, we clone all main_param to cpu to achieve cpu offload
+        # pipeline: backward and then copy grad to main_grad, then step
+
+        self.float16_groups = [] # all params in this list will get grad through backward
+        self.float32_groups = []
         self.fp32_from_float16_groups = []
-        self.fp32_from_fp32_groups = []
+        self.fp32_from_float32_groups = []
 
         # For all the groups in the original optimizer:
         for param_group in self.optimizer.param_groups:
             float16_params_this_group = []
-            fp32_params_this_group = []
+            float32_params_this_group = []
+
+            fp32_from_float32_params_this_group = []
             fp32_from_float16_params_this_group = []
             # For all the parameters in this group:
             for i, param in enumerate(param_group['params']):
                 if param.requires_grad:
-
                     # float16 params:
                     if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
                         float16_params_this_group.append(param)
                         # Create a copy
-                        main_param = param.detach().clone().float()
+
+                        if self.cpu_offload:
+                            main_param = param.detach().cpu().float()
+                        else:
+                            main_param = param.detach().float()
+
                         # Copy tensor model parallel attributes.
                         tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
                         if hasattr(param, 'shared'):
@@ -496,11 +605,23 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         fp32_from_float16_params_this_group.append(main_param)
                         # Reset existing state dict key to the new main param.
                         if param in self.optimizer.state:
+                            # NOTE: possible dtype mismatch
                             self.optimizer.state[main_param] = self.optimizer.state.pop(param)
                     # fp32 params.
                     elif param.type() == 'torch.cuda.FloatTensor':
-                        fp32_params_this_group.append(param)
-                        param_group['params'][i] = param
+                        float32_params_this_group.append(param)
+                        if self.cpu_offload:
+                            main_param = param.detach().cpu().float()
+                            # Copy tensor model parallel attributes.
+                            tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
+                            if hasattr(param, 'shared'):
+                                main_param.shared = param.shared
+                            if param in self.optimizer.state:
+                                self.optimizer.state[main_param] = self.optimizer.state.pop(param)
+                        else:
+                            main_param = param
+                        fp32_from_float32_params_this_group.append(main_param)
+                        param_group['params'][i] = main_param
 
                     else:
                         raise TypeError(
@@ -512,8 +633,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         )
 
             self.float16_groups.append(float16_params_this_group)
+            self.float32_groups.append(float32_params_this_group)
+            # NOTE: may on cpu/cuda depends on cpu_offload option
+            # if on cuda, fp32_from_fp32 do *no copy*
             self.fp32_from_float16_groups.append(fp32_from_float16_params_this_group)
-            self.fp32_from_fp32_groups.append(fp32_params_this_group)
+            self.fp32_from_float32_groups.append(fp32_from_float32_params_this_group)
+        pass
 
     def zero_grad(self, set_to_none=True):
         """We only need to zero the model related parameters, i.e.,
@@ -523,10 +648,15 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         used by this field can be safely deallocated at this point."""
         for group in self.float16_groups:
             _zero_grad_group_helper(group, set_to_none)
+        for group in self.float32_groups:
+            _zero_grad_group_helper(group, set_to_none)
         for group in self.fp32_from_float16_groups:
             _zero_grad_group_helper(group, set_to_none)
-        for group in self.fp32_from_fp32_groups:
-            _zero_grad_group_helper(group, set_to_none)
+        if self.cpu_offload:
+            # when cpu_offload is True, a copy on fp32 param occurs
+            # therefore an extra zero_grad required
+            for group in self.fp32_from_float32_groups:
+                _zero_grad_group_helper(group, set_to_none)
 
     def _collect_main_grad_data_for_unscaling(self):
 
@@ -539,7 +669,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                     main_grads.append(main_param.grad.data)
 
         # Append fp32 parameters.
-        for main_group in self.fp32_from_fp32_groups:
+        for main_group in self.fp32_from_float32_groups:
             for main_param in main_group:
                 if main_param.grad is not None:
                     main_grads.append(main_param.grad.data)
@@ -555,32 +685,104 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 main_data.append(main_param.data)
         return model_data, main_data
 
-    def _copy_model_grads_to_main_grads(self):
-        # This only needs to be done for the float16 group.
+    def _get_model_and_main_params_data_float32(self):
+        model_data = []
+        main_data = []
+        for model_group, main_group in zip(self.float32_groups, self.fp32_from_float32_groups):
+            for model_param, main_param in zip(model_group, main_group):
+                model_data.append(model_param.data)
+                main_data.append(main_param.data)
+        return model_data, main_data
+    
+    def _collect_grads(self):
+        main_param_id_to_main_grad_mapping = {}
+        main_grads = []
         for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
             for model_param, main_param in zip(model_group, main_group):
                 if hasattr(model_param, 'main_grad'):
-                    main_param.grad = model_param.main_grad.float()
+                    main_grads.append(model_param.main_grad.float())
+                    main_param_id_to_main_grad_mapping[id(main_param)] = main_grads[-1]
+
                 else:
                     if model_param.grad is not None:
-                        main_param.grad = model_param.grad.float()
-
-                # Safe to deallocate model's grad/main_grad after copying.
-                # (If using contiguous buffers, main_grad's memory should
-                # persist and therefore should not be deallocated.)
+                        main_grads.append(model_param.grad.float())
+                        main_param_id_to_main_grad_mapping[id(main_param)] = main_grads[-1]
+                model_param.grad = None
+                
+        for model_group, main_group in zip(self.float32_groups, self.fp32_from_float32_groups):
+            for model_param, main_param in zip(model_group, main_group):
+                if hasattr(model_param, 'main_grad'):
+                    main_grads.append(model_param.main_grad.float())
+                    main_param_id_to_main_grad_mapping[id(main_param)] = main_grads[-1]
+                else:
+                    if model_param.grad is not None:
+                        main_grads.append(model_param.grad.float())
+                        main_param_id_to_main_grad_mapping[id(main_param)] = main_grads[-1]
                 model_param.grad = None
 
-        # For fp32 grads, we need to reset the grads to main grad.
-        for model_group in self.fp32_from_fp32_groups:
-            for model_param in model_group:
-                model_param.grad = model_param.main_grad
+        return main_grads, main_param_id_to_main_grad_mapping
+
+    def _dispatch_grads(self, params, main_param_id_to_main_grad_mapping):
+        if params is None:
+            params = self.get_parameters()
+        for param in params:
+            if id(param) in main_param_id_to_main_grad_mapping:
+                param.grad = main_param_id_to_main_grad_mapping[id(param)].cpu()
+
+    def _copy_model_grads_to_main_grads(self):
+        if self.cpu_offload:
+            for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
+                for model_param, main_param in zip(model_group, main_group):
+                    if hasattr(model_param, 'main_grad'):
+                        main_param.grad = model_param.main_grad.cpu().float()
+                    else:
+                        if model_param.grad is not None:
+                            main_param.grad = model_param.grad.cpu().float()
+                    model_param.grad = None
+
+            for model_group, main_group in zip(self.float32_groups, self.fp32_from_float32_groups):
+                for model_param, main_param in zip(model_group, main_group):
+                    if hasattr(model_param, 'main_grad'):
+                        main_param.grad = model_param.main_grad.cpu()
+                    else:
+                        if model_param.grad is not None:
+                            main_param.grad = model_param.grad.cpu()
+                    model_param.grad = None
+        else:
+            # This only needs to be done for the float16 group.
+            for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
+                for model_param, main_param in zip(model_group, main_group):
+                    if hasattr(model_param, 'main_grad'):
+                        main_param.grad = model_param.main_grad.float()
+                    else:
+                        if model_param.grad is not None:
+                            main_param.grad = model_param.grad.float()
+
+                    # Safe to deallocate model's grad/main_grad after copying.
+                    # (If using contiguous buffers, main_grad's memory should
+                    # persist and therefore should not be deallocated.)
+                    model_param.grad = None
+
+            # For fp32 grads, we need to reset the grads to main grad.
+            for model_group in self.fp32_from_float32_groups:
+                for model_param in model_group:
+                    model_param.grad = model_param.main_grad
 
     def _copy_main_params_to_model_params(self):
+        # NOTE: when cpu_offload is on, copy across device
         # Only needed for the float16 params.
-        model_data, main_data = self._get_model_and_main_params_data_float16()
-        _multi_tensor_copy_this_to_that(
-            this=main_data, that=model_data, overflow_buf=self._dummy_overflow_buf
-        )
+        if self.cpu_offload:
+            for model_param, main_param in zip(*self._get_model_and_main_params_data_float16()):
+                model_param.copy_(main_param.to(model_param.device))
+                                               
+            for model_param, main_param in zip(*self._get_model_and_main_params_data_float32()):
+                model_param.copy_(main_param.to(model_param.device))
+        else:
+            model_data, main_data = self._get_model_and_main_params_data_float16()
+            _multi_tensor_copy_this_to_that(
+                this=main_data, that=model_data, overflow_buf=self._dummy_overflow_buf
+            )
+            # if cpu_offload is off, no copy on fp32 params
 
     def _copy_model_params_to_main_params(self):
         # Only needed for the float16 params.
@@ -600,7 +802,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
     def sharded_state_dict(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
     ):
-
         if is_loading:
             self.init_state_fn(self.optimizer)
 
@@ -633,12 +834,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         return state_dict
 
     def load_state_dict(self, state_dict):
-        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
-        assert HAVE_APEX_OR_TE or pipeline_parallel_size == 1, (
-            f'When Apex and TE are not installed, restoring from a checkpoint with pipeline '
-            'parallel world size > 1 is currently unsupported.'
-        )
-
         # Optimizer.
         optimizer_key = 'optimizer'
         if optimizer_key not in state_dict:
@@ -782,12 +977,6 @@ class FP32Optimizer(MegatronOptimizer):
         return self.optimizer.state_dict()
 
     def load_state_dict(self, state_dict):
-        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
-        assert HAVE_APEX_OR_TE or pipeline_parallel_size == 1, (
-            f'When Apex and TE are not installed, restoring from a checkpoint with pipeline '
-            'parallel world size > 1 is currently unsupported.'
-        )
-
         self.optimizer.load_state_dict(state_dict)
 
     def sharded_state_dict(
@@ -801,6 +990,7 @@ class FP32Optimizer(MegatronOptimizer):
             model_sharded_state_dict, self.get_parameters()
         )
         optim_state_to_sharding_state(state_dict, id_to_sharded_param_map)
+
         return state_dict
 
 
