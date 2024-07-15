@@ -162,7 +162,7 @@ class MegatronOptimizer(ABC):
         params = self.get_parameters()
         grads_for_norm = self.get_main_grads_for_grad_norm()
         grad_norm = get_grad_norm_fp32(
-            grads_for_norm, model_parallel_group=self.get_model_parallel_group(), norm_type=1.0
+            grads_for_norm, model_parallel_group=self.get_model_parallel_group()
         )
         clip_grad_by_total_norm_fp32(params, clip_grad, grad_norm)
         return grad_norm
