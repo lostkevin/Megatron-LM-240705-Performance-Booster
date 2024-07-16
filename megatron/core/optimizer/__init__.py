@@ -253,7 +253,8 @@ def _get_megatron_optimizer_based_on_param_groups(
             config,
             grad_scaler,
             init_state_fn,
-            cpu_offload
+            cpu_offload,
+            config.async_d2h
         ]
         if config.use_distributed_optimizer:
             optimizer = DistributedOptimizer(

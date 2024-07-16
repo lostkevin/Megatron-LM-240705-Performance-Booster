@@ -1426,6 +1426,9 @@ def _add_distributed_args(parser):
                         help='If set, distributed ranks initialize order is changed '
                         'from tp-dp-pp to tp-pp-dp. Make sure EP and CP aren\'t used '
                         'with this option enabled')
+    group.add_argument('--async-d2h', action='store_true', default=False,
+                        help='If set, the grad will be copied to CPU asynchrously, only '
+                        'valid when optimizer is cpu-adam')
     return parser
 
 

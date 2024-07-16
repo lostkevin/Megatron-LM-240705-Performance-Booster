@@ -192,7 +192,7 @@ def pretrain(train_valid_test_dataset_provider,
 
     args = get_args()
     timers = get_timers()
-
+    timers._log_level = 1
     if args.log_progress:
         append_to_progress_log("Starting job")
 
@@ -428,7 +428,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                      model_chunk,
                      # Turn off bucketing for model_chunk 2 onwards, since communication for these
                      # model chunks is overlapped with compute anyway.
-                     disable_bucketing=(model_chunk_idx > 0))
+                     disable_bucketing=(model_chunk_idx > 0),
+                     async_d2h=args.async_d2h
+                    )
                  for (model_chunk_idx, model_chunk) in enumerate(model)]
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
@@ -548,6 +550,18 @@ def train_step(forward_step_func, data_iterator,
     # Set grad to zero.
     for model_chunk in model:
         model_chunk.zero_grad_buffer()
+    
+        # NOTE: for grad scaler in async d2h copy
+        # if (
+        #     isinstance(model_chunk, DDP) and
+        #     model_chunk.async_d2h and 
+        #     hasattr(optimizer, 'grad_scaler') and 
+        #     optimizer.grad_scaler is not None
+        # ):
+        #     model_chunk.register_inv_scale(
+        #         optimizer.grad_scaler.inv_scale
+        #     )
+
     optimizer.zero_grad()
 
     # Forward pass.
@@ -682,6 +696,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         'optimizer-count-zeros',
         'optimizer-inner-step',
         'optimizer-copy-main-to-model-params',
+        'optimizer-copy-grad-to-cpu',
         'optimizer']
 
     # Calculate batch size.
@@ -938,6 +953,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     num_floating_point_operations_so_far = args.num_floating_point_operations_so_far
 
     # Setup some training config params
+    # TODO: check the following options
     config.grad_scale_func = optimizer.scale_loss
     config.timers = timers
     if isinstance(model[0], DDP) and args.overlap_grad_reduce:

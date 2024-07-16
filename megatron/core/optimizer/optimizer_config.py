@@ -100,6 +100,8 @@ class OptimizerConfig:
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute in distributed optimizer."""
 
+    async_d2h: bool = False
+
     ################
     # Miscellaneous
     ################

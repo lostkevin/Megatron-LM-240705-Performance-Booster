@@ -277,6 +277,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         config: OptimizerConfig,
         grad_scaler: Optional[MegatronGradScaler],
         init_state_fn: Callable,
+        async_d2h: bool
     ):
 
         super().__init__(
@@ -284,6 +285,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             config,
             init_state_fn,
         )
+        self.async_d2h = async_d2h
         self.grad_scaler = grad_scaler
 
         # None grad scaler is only supported for bf16.
@@ -413,7 +415,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             # We are done with scaling gradients
             # so we can update the loss scale.
             self.grad_scaler.update(found_inf_flag)
-            
+
             if found_inf_flag:
                 return False, None, None
 
@@ -504,7 +506,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         timers = self.config.timers
         # 1. collect fp32 grads from fp16 model
         params = None
-        main_grads, main_param_id_to_main_grad_mapping = self._collect_grads_from_cpu()
+        if self.async_d2h:
+            main_grads, main_param_id_to_main_grad_mapping = self._collect_grads_from_cpu()
+        else:
+            main_grads, main_param_id_to_main_grad_mapping = self._collect_grads()
         assert self.grad_scaler is None
         assert self.config.clip_grad == 0.0
 
@@ -581,6 +586,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         grad_scaler: MegatronGradScaler,
         init_state_fn: Callable,
         cpu_offload: bool = False,
+        async_d2h: bool = False
     ):
 
         super().__init__(
@@ -588,6 +594,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             config,
             grad_scaler,
             init_state_fn,
+            async_d2h
         )
 
         # Handle main parameters.

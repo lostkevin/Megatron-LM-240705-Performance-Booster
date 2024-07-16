@@ -416,10 +416,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         grad_scaler: MegatronGradScaler,
         init_state_fn: Optional[Callable],
         cpu_offload: bool,
+        async_d2h: bool,
         per_model_buffers: Dict[int, List[ParamAndGradBuffer]],
         data_parallel_group: torch.distributed.ProcessGroup,
         data_parallel_group_gloo: torch.distributed.ProcessGroup,
         data_parallel_group_idx: int,
+        
     ):
         """
         Distributed optimizer, for all data types (fp16, bf16, and fp32).
@@ -460,6 +462,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             config,
             grad_scaler,
             init_state_fn,
+            async_d2h=async_d2h
         )
 
         self.cpu_offload = cpu_offload
