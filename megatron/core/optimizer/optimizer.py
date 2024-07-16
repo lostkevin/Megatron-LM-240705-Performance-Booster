@@ -507,11 +507,119 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         # 1. collect fp32 grads from fp16 model
         params = None
         if self.async_d2h:
-            main_grads, main_param_id_to_main_grad_mapping = self._collect_grads_from_cpu()
+            model_params, main_grads, main_param_id_to_main_grad_mapping = self._collect_params_and_grads_from_cpu()
         else:
             main_grads, main_param_id_to_main_grad_mapping = self._collect_grads()
-        assert self.grad_scaler is None
-        assert self.config.clip_grad == 0.0
+            model_params = [] # NOTE: not used
+
+        # 2. unscale / check inf
+        # Reset found inf.
+        if self.grad_scaler:
+            if timers is not None:
+                timers('optimizer-unscale-and-check-inf', log_level=1).start(
+                    barrier=self.config.barrier_with_L1_time
+                )
+            
+            
+            if self.async_d2h:
+                # obtain found_inf from param.found_inf
+                params = self.get_parameters()
+                for param in params:
+                    self.found_inf += param.found_inf
+                torch.distributed.all_reduce(
+                        self.found_inf,
+                        op=torch.distributed.ReduceOp.MAX, 
+                        group=self.get_model_parallel_group()
+                    )
+            else:
+                self.found_inf.fill_(0.0)
+
+                # Unscale and set found inf/nan
+                torch._amp_foreach_non_finite_check_and_unscale_(
+                    main_grads, self.found_inf, self.grad_scaler.inv_scale
+                )
+
+                # Update across all model parallel instances.
+                torch.distributed.all_reduce(
+                    self.found_inf, op=torch.distributed.ReduceOp.MAX, group=self.get_model_parallel_group()
+                )
+
+            # Check for nan.
+            found_inf_flag = self.found_inf.item() > 0
+            if timers is not None:
+                timers('optimizer-unscale-and-check-inf').stop()
+
+            # We are done with scaling gradients
+            # so we can update the loss scale.
+            self.grad_scaler.update(found_inf_flag)
+
+            if found_inf_flag:
+                return False, None, None
+
+
+        # 3. compute grad norm and clip
+        if timers is not None:
+            timers('optimizer-clip-main-grad', log_level=1).start(
+                barrier=self.config.barrier_with_L1_time
+            )
+        grad_norm = None
+        def _internal_get_grad_norm(model_params):
+            grad_norm = torch.zeros([1])
+            for param in model_params:
+                # O(n) to O(n^2)
+                is_not_shared = param_is_not_shared(param)
+                is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(param)
+                if is_not_shared and is_not_tp_duplicate:
+                    grad_norm += param.grad_norm_cpu
+            return grad_norm
+
+        def _internal_get_main_grads_for_grad_norm(params):
+            grads_for_norm = []
+            for param in params:
+                # O(n) to O(n^2)
+                if id(param) not in main_param_id_to_main_grad_mapping:
+                    continue
+                grad = main_param_id_to_main_grad_mapping[id(param)]
+                is_not_shared = param_is_not_shared(param)
+                is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(param)
+                if is_not_shared and is_not_tp_duplicate:
+                    grads_for_norm.append(grad)
+            return grads_for_norm
+        
+        def _internal_clip_grad_by_total_norm_fp32(
+            main_grads: Union[List[torch.Tensor], torch.Tensor],
+            max_norm: Union[int, float],
+            total_norm: float,
+        ):
+            # Grads.
+            grads = []
+            for g in main_grads:
+                assert g.type() == 'torch.cuda.FloatTensor'
+                grads.append(g.detach())
+
+            # Scale.
+            clip_coeff = max_norm / (total_norm + 1.0e-6)
+            if clip_coeff < 1.0:
+                dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+                multi_tensor_applier(multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff)
+
+        if self.config.clip_grad > 0.0:
+            if self.async_d2h:
+                grad_norm = _internal_get_grad_norm(model_params)
+                clip_coeff = self.config.clip_grad / (grad_norm + 1.0e-6)
+                for main_grad in main_grads:
+                    main_grad.data.mul_(clip_coeff)
+            else:
+                if params is None:
+                    params = self.get_parameters()
+                grads_for_norm = _internal_get_main_grads_for_grad_norm(params)
+                grad_norm = get_grad_norm_fp32(
+                    grads_for_norm, model_parallel_group=self.get_model_parallel_group()
+                )
+                _internal_clip_grad_by_total_norm_fp32(main_grads, self.config.clip_grad, grad_norm)
+
+        if timers is not None:
+            timers('optimizer-clip-main-grad').stop()
 
         if timers is not None:
             timers('optimizer-copy-grad-to-cpu', log_level=1).start(
@@ -529,8 +637,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
     def step(self):
         timers = self.config.timers
         if getattr(self, 'cpu_offload', False):
-            # success, grad_norm, num_zeros_in_grad = self.preprocess_grads()
-            success, grad_norm, num_zeros_in_grad = self._demo_preprocess()
+            success, grad_norm, num_zeros_in_grad = self.preprocess_grads()
+            # success, grad_norm, num_zeros_in_grad = self._demo_preprocess()
             if success:
                 success = self.step_with_ready_grads()
             # Successful update.
@@ -768,9 +876,11 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
         return main_grads, main_param_id_to_main_grad_mapping
 
-    def _collect_grads_from_cpu(self):
+    def _collect_params_and_grads_from_cpu(self):
+        main_param_id_to_main_grad_mapping_cpu = {}
         main_param_id_to_main_grad_mapping = {}
         main_grads = []
+        model_params = []
         groups = [
             (self.float16_groups, self.fp32_from_float16_groups),
             (self.float32_groups, self.fp32_from_float32_groups)
@@ -779,10 +889,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             for model_group, main_group in zip(*g):
                 for model_param, main_param in zip(model_group, main_group):
                     main_grads.append(model_param.main_grad_cpu)
+                    main_param_id_to_main_grad_mapping_cpu[id(main_param)] = main_grads[-1]
                     main_param_id_to_main_grad_mapping[id(main_param)] = main_grads[-1]                
                     model_param.grad = None
+                    model_params.append(model_param)
             
-        return main_grads, main_param_id_to_main_grad_mapping
+        return model_params, main_grads, main_param_id_to_main_grad_mapping_cpu
     
     def _dispatch_grads(self, params, main_param_id_to_main_grad_mapping):
         if params is None:

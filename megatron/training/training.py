@@ -552,15 +552,15 @@ def train_step(forward_step_func, data_iterator,
         model_chunk.zero_grad_buffer()
     
         # NOTE: for grad scaler in async d2h copy
-        # if (
-        #     isinstance(model_chunk, DDP) and
-        #     model_chunk.async_d2h and 
-        #     hasattr(optimizer, 'grad_scaler') and 
-        #     optimizer.grad_scaler is not None
-        # ):
-        #     model_chunk.register_inv_scale(
-        #         optimizer.grad_scaler.inv_scale
-        #     )
+        if (
+            isinstance(model_chunk, DDP) and
+            model_chunk.async_d2h and 
+            hasattr(optimizer, 'grad_scaler') and 
+            optimizer.grad_scaler is not None
+        ):
+            model_chunk.register_inv_scale(
+                optimizer.grad_scaler.inv_scale
+            )
 
     optimizer.zero_grad()
 

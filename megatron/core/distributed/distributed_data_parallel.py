@@ -301,6 +301,10 @@ class DistributedDataParallel(MegatronModule):
                 src=torch.distributed.get_global_rank(data_parallel_group, 0),
                 group=data_parallel_group,
             )
+    
+    def register_inv_scale(self, inv_scale: torch.Tensor):
+        for buffer in self.buffers + self.expert_parallel_buffers:
+            buffer.register_inv_scale(inv_scale)     
 
     def state_dict(self, prefix='', keep_vars=False):
         """

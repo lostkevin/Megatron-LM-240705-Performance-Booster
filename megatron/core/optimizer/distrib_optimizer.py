@@ -421,7 +421,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_group: torch.distributed.ProcessGroup,
         data_parallel_group_gloo: torch.distributed.ProcessGroup,
         data_parallel_group_idx: int,
-        
     ):
         """
         Distributed optimizer, for all data types (fp16, bf16, and fp32).
@@ -1589,10 +1588,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         collect_group_grads(self.model_fp32_groups, self.shard_fp32_from_float32_groups)
         return shard_main_grads, shard_main_param_id_to_shard_main_grad_mapping
 
-    def _collect_grads_from_cpu(self):
+    def _collect_params_and_grads_from_cpu(self):
         shard_main_param_id_to_shard_main_grad_mapping = {}
         shard_main_grads = []
-
+        model_params = []
         # Utility method for copying group grads.
         def collect_group_grads(model_groups, shard_main_groups):
             for model_group, shard_main_group in zip(model_groups, shard_main_groups):
@@ -1607,11 +1606,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     shard_main_grads.append(shard_model_grad)
                     shard_main_param_id_to_shard_main_grad_mapping[id(shard_main_param)] = shard_main_grads[-1]
+                    model_params.append(model_param)
 
         # Copy model groups to shard groups.
         collect_group_grads(self.model_float16_groups, self.shard_fp32_from_float16_groups)
         collect_group_grads(self.model_fp32_groups, self.shard_fp32_from_float32_groups)
-        return shard_main_grads, shard_main_param_id_to_shard_main_grad_mapping
+        return model_params, shard_main_grads, shard_main_param_id_to_shard_main_grad_mapping
     
     def _dispatch_grads(self, params, main_param_id_to_main_grad_mapping):
         if params is None:

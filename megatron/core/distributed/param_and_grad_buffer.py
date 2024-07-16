@@ -87,6 +87,8 @@ class Bucket:
             assert copy_stream is not None, f"A global stream for async d2h copy is required."
             self.local_grad_norm = None # TODO: add grad norm computation for local bucket
             self.copy_stream = copy_stream
+            self.inv_scale = None # for inf and unscale in amp
+            self.found_inf = torch.zeros([1], device=grad_data.device)
             
         # The distributed optimizer needs to keep track of this bucket's offset
         # within the full grad_buffer.
@@ -106,6 +108,7 @@ class Bucket:
         self.params_with_grad = set()
         self.communication_handle = None
         self.is_communication_outstanding = False
+        self.inv_scale = None
 
     def start_grad_sync(self):
         """
@@ -156,26 +159,34 @@ class Bucket:
                     local_data_view = shard_buffer(self.grad_data, self.data_parallel_world_size)[
                         self.data_parallel_rank
                     ]
-                    self.communication_handle = torch.distributed._reduce_scatter_base(
+                    torch.distributed._reduce_scatter_base(
                         local_data_view,
                         self.grad_data,
                         op=reduce_op,
                         group=self.data_parallel_group,
-                        async_op=False,
                     )
                 else:
-                    self.communication_handle = torch.distributed.all_reduce(
+                    torch.distributed.all_reduce(
                         self.grad_data,
                         op=reduce_op,
                         group=self.data_parallel_group,
-                        async_op=False,
                     )
                 
                 # TODO: add local grad_norm computation code for grad-clipping
-
+                if self.inv_scale is not None:
+                    self.found_inf.fill_(0)
+                    torch._amp_foreach_non_finite_check_and_unscale_(
+                        [self.grad_data], self.found_inf, self.inv_scale
+                    )
+                    
                 # copy grad to cpu, possibly a dtype conversion
                 self.grad_data_cpu.copy_(self.grad_data.data, non_blocking=True)
                 
+                # NOTE: compute grad_norm for each params:
+                for param in self.params_with_grad:
+                    param.grad_norm_cpu = torch.norm(param.data, p=2, dtype=torch.float32).to('cpu', non_blocking=True)
+
+                    pass
 
         else:
             # Use async_op only when overlap_grad_reduce is True.
@@ -246,6 +257,10 @@ class Bucket:
         if len(self.params_with_grad) == len(self.params):
             self.start_grad_sync()
 
+    def register_inv_scale(self, inv_scale: torch.Tensor):
+        assert self.async_d2h is True, \
+            "This function should be used only when async_d2h is True!"
+        self.inv_scale = inv_scale
 
 class ParamAndGradBuffer:
     """
@@ -469,6 +484,7 @@ class ParamAndGradBuffer:
                     param.data.shape, data_start_index, buffer_type=BufferType.GRAD_CPU
                 )
 
+
             if bucket_id != cur_bucket_id:
                 bucket_data_end_index = _pad_end_of_bucket_if_needed(data_start_index)
                 self._set_bucket(
@@ -485,6 +501,7 @@ class ParamAndGradBuffer:
                 cur_bucket_id = bucket_id
             bucket_params.add(param)
 
+
         # Add remaining params to a new bucket.
         if len(bucket_params) > 0:
             bucket_data_end_index = _pad_end_of_bucket_if_needed(data_end_index)
@@ -495,6 +512,13 @@ class ParamAndGradBuffer:
                 numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
                 bucket_id=cur_bucket_id,
             )
+
+        if self.async_d2h:
+            for param in params[::-1]:
+                if not param.requires_grad:
+                    continue
+                data_start_index, data_end_index, bucket_id = self.param_index_map[param]
+                param.found_inf = self.buckets[bucket_id].found_inf
 
         # Log buckets for all PP stages.
         log_strs = []
@@ -637,3 +661,7 @@ class ParamAndGradBuffer:
         if self.is_last_microbatch:
             bucket = self.param_to_bucket[param]
             bucket.register_grad_ready(param)
+
+    def register_inv_scale(self, inv_scale: torch.Tensor):
+        for bucket in self.buckets:
+            bucket.register_inv_scale(inv_scale)     
