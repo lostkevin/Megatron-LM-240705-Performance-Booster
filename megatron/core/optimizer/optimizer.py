@@ -410,6 +410,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             if timers is not None:
                 timers('optimizer-unscale-and-check-inf').stop()
 
+            # We are done with scaling gradients
+            # so we can update the loss scale.
+            self.grad_scaler.update(found_inf_flag)
+            
             if found_inf_flag:
                 return False, None, None
 

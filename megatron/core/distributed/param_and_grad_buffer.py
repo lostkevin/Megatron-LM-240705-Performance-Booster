@@ -151,8 +151,7 @@ class Bucket:
             # 3. NCCL stream for all-reduce
             # Work.wait() will finally call ncclEndEvent_->block(currentStream)
             with torch.cuda.stream(self.copy_stream):
-                # NOTE: no need to use async_op because we're in anon-blocking context
-                # TODO: check
+                # NOTE: no need to use async_op because we're in a non-blocking context
                 if self.ddp_config.use_distributed_optimizer:
                     local_data_view = shard_buffer(self.grad_data, self.data_parallel_world_size)[
                         self.data_parallel_rank
@@ -176,7 +175,7 @@ class Bucket:
 
                 # copy grad to cpu, possibly a dtype conversion
                 self.grad_data_cpu.copy_(self.grad_data.data, non_blocking=True)
-                # NOTE: currently we do not release GPU grad for simplicity
+                
 
         else:
             # Use async_op only when overlap_grad_reduce is True.
@@ -214,6 +213,8 @@ class Bucket:
         """
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if self.async_d2h:
+            if not self.ddp_config.overlap_grad_reduce:
+                self.start_grad_sync()
             torch.cuda.current_stream().wait_stream(self.copy_stream)
             return
 
