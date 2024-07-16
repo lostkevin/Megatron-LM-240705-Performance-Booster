@@ -40,9 +40,11 @@ class DistributedDataParallel(MegatronModule):
         ddp_config: DistributedDataParallelConfig,
         module: torch.nn.Module,
         disable_bucketing: bool = False,
+        async_d2h: bool = True
     ):
         super().__init__(config=config)
         self.module = module
+        self.async_d2h = async_d2h
 
         # If bucket_size is not provided as an input, use sane default.
         # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
@@ -134,6 +136,7 @@ class DistributedDataParallel(MegatronModule):
                         self.bucket_size,
                         param_to_name,
                         gradient_scaling_factor,
+                        async_d2h=self.async_d2h
                     )
                 )
                 for param in params:

@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 class BufferType(Enum):
     PARAM = 1
     GRAD = 2
+    GRAD_CPU = 3
 
 
 def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
@@ -42,6 +43,7 @@ class Bucket:
         params: List of parameters whose gradients are collated in this bucket.
         param_data: View in larger ParamAndGradBuffer.param_data that this bucket is responsible for.
         grad_data: View in larger ParamAndGradBuffer.grad_data that this bucket is responsible for.
+        grad_data_cpu: View in larger ParamAndGradBuffer.grad_data_cpu that this bucket is responsible for.
         offset: Offset of this bucket's view in the larger ParamAndGradBuffer.
         numel_unpadded: Number of unpadded elements in bucket.
         data_parallel_group: Data-parallel process group.
@@ -57,11 +59,14 @@ class Bucket:
         params: List[torch.nn.Parameter],
         param_data: Optional[torch.Tensor],
         grad_data: torch.Tensor,
+        grad_data_cpu: Optional[torch.Tensor],
         offset: int,
         numel_unpadded: int,
         data_parallel_group: torch.distributed.ProcessGroup,
         data_parallel_world_size: int,
         gradient_scaling_factor: float,
+        async_d2h: bool = False,
+        copy_stream: Optional[torch.cuda.Stream] = None
     ):
         self.ddp_config = ddp_config
 
@@ -74,6 +79,15 @@ class Bucket:
         self.params_with_grad = set()
         self.param_data = param_data
         self.grad_data = grad_data
+        self.grad_data_cpu = grad_data_cpu # NOTE: only used when self.async_d2h is True (otherwise should be None)
+
+        # pre-allocate of cpu-grad-buffer (pinned)
+        self.async_d2h = async_d2h
+        if self.async_d2h:
+            assert copy_stream is not None, f"A global stream for async d2h copy is required."
+            self.local_grad_norm = None # TODO: add grad norm computation for local bucket
+            self.copy_stream = copy_stream
+            
         # The distributed optimizer needs to keep track of this bucket's offset
         # within the full grad_buffer.
         self.offset = offset
@@ -105,6 +119,8 @@ class Bucket:
         assert (
             self.communication_handle is None and not self.is_communication_outstanding
         ), 'Should not have multiple communication calls outstanding at once'
+        # NOTE: we always assume the current stream is a non-default stream to avoid
+        # synchronizing.
 
         # Make sure norm of grads in bucket are not NaN
         # prior to data-parallel all-reduce / reduce-scatter.
@@ -127,25 +143,62 @@ class Bucket:
         if self.ddp_config.average_in_collective:
             reduce_op = torch.distributed.ReduceOp.AVG
 
-        # Use async_op only when overlap_grad_reduce is True.
-        if self.ddp_config.use_distributed_optimizer:
-            local_data_view = shard_buffer(self.grad_data, self.data_parallel_world_size)[
-                self.data_parallel_rank
-            ]
-            self.communication_handle = torch.distributed._reduce_scatter_base(
-                local_data_view,
-                self.grad_data,
-                op=reduce_op,
-                group=self.data_parallel_group,
-                async_op=self.ddp_config.overlap_grad_reduce,
-            )
+        if self.async_d2h:
+            # NOTE: if pipelining is True, D2H on the copy stream
+            # Here are 3 non-default streams:
+            # 1. backward stream
+            # 2. D2H stream
+            # 3. NCCL stream for all-reduce
+            # Work.wait() will finally call ncclEndEvent_->block(currentStream)
+            with torch.cuda.stream(self.copy_stream):
+                # NOTE: no need to use async_op because we're in anon-blocking context
+                # TODO: check
+                if self.ddp_config.use_distributed_optimizer:
+                    local_data_view = shard_buffer(self.grad_data, self.data_parallel_world_size)[
+                        self.data_parallel_rank
+                    ]
+                    self.communication_handle = torch.distributed._reduce_scatter_base(
+                        local_data_view,
+                        self.grad_data,
+                        op=reduce_op,
+                        group=self.data_parallel_group,
+                        async_op=False,
+                    )
+                else:
+                    self.communication_handle = torch.distributed.all_reduce(
+                        self.grad_data,
+                        op=reduce_op,
+                        group=self.data_parallel_group,
+                        async_op=False,
+                    )
+                
+                # TODO: add local grad_norm computation code for grad-clipping
+
+                # copy grad to cpu, possibly a dtype conversion
+                self.grad_data_cpu.copy_(self.grad_data.data, non_blocking=True)
+                # NOTE: currently we do not release GPU grad for simplicity
+
         else:
-            self.communication_handle = torch.distributed.all_reduce(
-                self.grad_data,
-                op=reduce_op,
-                group=self.data_parallel_group,
-                async_op=self.ddp_config.overlap_grad_reduce,
-            )
+            # Use async_op only when overlap_grad_reduce is True.
+            if self.ddp_config.use_distributed_optimizer:
+                local_data_view = shard_buffer(self.grad_data, self.data_parallel_world_size)[
+                    self.data_parallel_rank
+                ]
+                self.communication_handle = torch.distributed._reduce_scatter_base(
+                    local_data_view,
+                    self.grad_data,
+                    op=reduce_op,
+                    group=self.data_parallel_group,
+                    async_op=self.ddp_config.overlap_grad_reduce,
+                )
+            else:
+                self.communication_handle = torch.distributed.all_reduce(
+                    self.grad_data,
+                    op=reduce_op,
+                    group=self.data_parallel_group,
+                    async_op=self.ddp_config.overlap_grad_reduce,
+                )
+        
         if self.ddp_config.overlap_grad_reduce:
             self.is_communication_outstanding = True
         else:
@@ -160,13 +213,19 @@ class Bucket:
         call to complete. When overlap_grad_reduce is set to False, makes synchronous call.
         """
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
+        if self.async_d2h:
+            torch.cuda.current_stream().wait_stream(self.copy_stream)
+            return
+
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync()
             return
+        
         assert self.communication_handle is not None and self.is_communication_outstanding, (
             f'Communication call has not been issued for this bucket '
             f'({len(self.params_with_grad)}/{len(self.params)} params have grad available)'
         )
+
         self.communication_handle.wait()
 
     def register_grad_ready(self, param: torch.nn.Parameter):
@@ -216,8 +275,14 @@ class ParamAndGradBuffer:
         bucket_size: int,
         param_to_name: Dict[torch.nn.Parameter, str],
         gradient_scaling_factor: float,
+        async_d2h: bool = False
     ):
         self.ddp_config = ddp_config
+        # async d2h copy configs.
+        self.async_d2h = async_d2h
+        self.copy_stream = None
+        if self.async_d2h:
+            self.copy_stream = torch.cuda.Stream()
 
         # Check that params are unique.
         unique_params = set()
@@ -370,6 +435,10 @@ class ParamAndGradBuffer:
             requires_grad=False,
         )
 
+        self.grad_data_cpu = None
+        if self.async_d2h:
+            self.grad_data_cpu = self.grad_data.float().cpu().pin_memory()
+
         # Finally, map param.data and param.main_grad fields to buffers.
         bucket_params = set()
         bucket_data_start_index = 0
@@ -390,9 +459,15 @@ class ParamAndGradBuffer:
                 param.data.detach().copy_(old_param_data)
                 del old_param_data
 
+            # main_grad is always a view of persistent buffer, may not be released?
             param.main_grad = self._get(
                 param.data.shape, data_start_index, buffer_type=BufferType.GRAD
             )
+            if self.async_d2h:
+                param.main_grad_cpu = self._get(
+                    param.data.shape, data_start_index, buffer_type=BufferType.GRAD_CPU
+                )
+
             if bucket_id != cur_bucket_id:
                 bucket_data_end_index = _pad_end_of_bucket_if_needed(data_start_index)
                 self._set_bucket(
@@ -436,7 +511,9 @@ class ParamAndGradBuffer:
 
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale the gradient data by `scaling_factor`."""
+        # NOTE: this function maybe called at any time, which introduce overheads
         self.grad_data *= scaling_factor
+        self.grad_data_cpu *= scaling_factor # NOTE: SLOW
 
     def _get(self, shape: torch.Size, start_index: int, buffer_type: BufferType) -> torch.Tensor:
         """
@@ -450,6 +527,8 @@ class ParamAndGradBuffer:
             buffer_tensor = self.param_data[start_index:end_index]
         elif buffer_type == BufferType.GRAD:
             buffer_tensor = self.grad_data[start_index:end_index]
+        elif buffer_type == BufferType.GRAD_CPU:
+            buffer_tensor = self.grad_data_cpu[start_index:end_index]
         else:
             raise Exception("Illegal buffer type provided to GradBuffer._get() function")
         buffer_tensor = buffer_tensor.view(shape)
@@ -484,16 +563,24 @@ class ParamAndGradBuffer:
         bucketed_grad_data = self._get(
             torch.Size([end_index - start_index]), start_index, buffer_type=BufferType.GRAD
         )
+        bucketed_grad_data_cpu = None
+        if self.async_d2h:
+            bucketed_grad_data_cpu = self._get(
+                torch.Size([end_index - start_index]), start_index, buffer_type=BufferType.GRAD_CPU
+            )
         bucket = Bucket(
             ddp_config=self.ddp_config,
             params=bucket_params,
             param_data=bucketed_param_data,
             grad_data=bucketed_grad_data,
+            grad_data_cpu=bucketed_grad_data_cpu,
             offset=start_index,
             numel_unpadded=numel_unpadded,
             data_parallel_group=self.data_parallel_group,
             data_parallel_world_size=self.data_parallel_world_size,
             gradient_scaling_factor=self.gradient_scaling_factor,
+            async_d2h=self.async_d2h,
+            copy_stream=self.copy_stream
         )
         self.buckets.append(bucket)
         for bucket_param in bucket_params:
@@ -506,6 +593,8 @@ class ParamAndGradBuffer:
         iteration of training.
         """
         self.grad_data.zero_()
+        if self.async_d2h:
+            self.grad_data_cpu.zero_()
         for bucket in self.buckets:
             bucket.reset()
         self.is_last_microbatch = True

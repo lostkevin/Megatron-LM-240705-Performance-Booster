@@ -1586,6 +1586,30 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         collect_group_grads(self.model_fp32_groups, self.shard_fp32_from_float32_groups)
         return shard_main_grads, shard_main_param_id_to_shard_main_grad_mapping
 
+    def _collect_grads_from_cpu(self):
+        shard_main_param_id_to_shard_main_grad_mapping = {}
+        shard_main_grads = []
+
+        # Utility method for copying group grads.
+        def collect_group_grads(model_groups, shard_main_groups):
+            for model_group, shard_main_group in zip(model_groups, shard_main_groups):
+                for model_param, shard_main_param in zip(model_group, shard_main_group):
+
+                    param_range_map = self._get_model_param_range_map(model_param)
+                    param_range = param_range_map["param"]
+                    assert param_range.size == shard_main_param.nelement()
+
+                    model_grad = model_param.main_grad_cpu
+                    shard_model_grad = model_grad.view(-1)[param_range.start : param_range.end]
+
+                    shard_main_grads.append(shard_model_grad)
+                    shard_main_param_id_to_shard_main_grad_mapping[id(shard_main_param)] = shard_main_grads[-1]
+
+        # Copy model groups to shard groups.
+        collect_group_grads(self.model_float16_groups, self.shard_fp32_from_float16_groups)
+        collect_group_grads(self.model_fp32_groups, self.shard_fp32_from_float32_groups)
+        return shard_main_grads, shard_main_param_id_to_shard_main_grad_mapping
+    
     def _dispatch_grads(self, params, main_param_id_to_main_grad_mapping):
         if params is None:
             params = self.get_parameters()

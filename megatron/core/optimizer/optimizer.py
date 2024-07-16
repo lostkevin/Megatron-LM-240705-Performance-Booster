@@ -495,11 +495,33 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         return True
 
+    def _demo_preprocess(self):
+        # NOTE: this function is called to collect FP32 grads on CPU
+        timers = self.config.timers
+        # 1. collect fp32 grads from fp16 model
+        params = None
+        main_grads, main_param_id_to_main_grad_mapping = self._collect_grads_from_cpu()
+        assert self.grad_scaler is None
+        assert self.config.clip_grad == 0.0
+
+        if timers is not None:
+            timers('optimizer-copy-grad-to-cpu', log_level=1).start(
+                barrier=self.config.barrier_with_L1_time
+            )
+        # 4. move these grads to CPU
+        self._dispatch_grads(params, main_param_id_to_main_grad_mapping)
+
+        if timers is not None:
+            timers('optimizer-copy-grad-to-cpu').stop()
+
+        return True, None, None
+
     @torch.no_grad()
     def step(self):
         timers = self.config.timers
         if getattr(self, 'cpu_offload', False):
-            success, grad_norm, num_zeros_in_grad = self.preprocess_grads()
+            # success, grad_norm, num_zeros_in_grad = self.preprocess_grads()
+            success, grad_norm, num_zeros_in_grad = self._demo_preprocess()
             if success:
                 success = self.step_with_ready_grads()
             # Successful update.
@@ -716,7 +738,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 if hasattr(model_param, 'main_grad'):
                     main_grads.append(model_param.main_grad.float())
                     main_param_id_to_main_grad_mapping[id(main_param)] = main_grads[-1]
-
                 else:
                     if model_param.grad is not None:
                         main_grads.append(model_param.grad.float())
@@ -736,6 +757,22 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
         return main_grads, main_param_id_to_main_grad_mapping
 
+    def _collect_grads_from_cpu(self):
+        main_param_id_to_main_grad_mapping = {}
+        main_grads = []
+        groups = [
+            (self.float16_groups, self.fp32_from_float16_groups),
+            (self.float32_groups, self.fp32_from_float32_groups)
+        ]
+        for g in groups:
+            for model_group, main_group in zip(*g):
+                for model_param, main_param in zip(model_group, main_group):
+                    main_grads.append(model_param.main_grad_cpu)
+                    main_param_id_to_main_grad_mapping[id(main_param)] = main_grads[-1]                
+                    model_param.grad = None
+            
+        return main_grads, main_param_id_to_main_grad_mapping
+    
     def _dispatch_grads(self, params, main_param_id_to_main_grad_mapping):
         if params is None:
             params = self.get_parameters()
